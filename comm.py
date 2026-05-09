@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_marshmallow import Marshmallow
-from marshmallow import ValidationError
+from marshmallow import ValidationError, fields, validate
 from datetime import datetime
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func
 
 
 app = Flask(__name__)
@@ -64,7 +67,7 @@ class Product(db.Model):
     __tablename__ = 'products'
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    product_name = db.Column(db.String(100), nullable=False)
+    product_name = db.Column(db.String(100), unique=True, nullable=False)
     price = db.Column(db.Float, nullable=False)
 
     def __repr__(self):
@@ -91,10 +94,28 @@ class ProductSchema(ma.SQLAlchemyAutoSchema):
 
 # Order Schema
 class OrderSchema(ma.SQLAlchemyAutoSchema):
+    products = fields.Nested(ProductSchema, many=True)
+    
     class Meta:
         model = Order
         include_fk = True
         load_instance = True
+
+
+class UserInputSchema(ma.Schema):
+    name = fields.String(required=True, validate=validate.Length(min=1))
+    address = fields.String(required=True, validate=validate.Length(min=1))
+    email = fields.Email(required=True)
+
+
+class ProductInputSchema(ma.Schema):
+    product_name = fields.String(required=True, validate=validate.Length(min=1))
+    price = fields.Float(required=True, validate=validate.Range(min=0))
+
+
+class OrderInputSchema(ma.Schema):
+    user_id = fields.Integer(required=True)
+    order_date = fields.DateTime(required=False)
 
 user_schema = UserSchema()
 users_schema = UserSchema(many=True)
@@ -104,6 +125,10 @@ products_schema = ProductSchema(many=True)
 
 order_schema = OrderSchema()
 orders_schema = OrderSchema(many=True)
+
+user_input_schema = UserInputSchema()
+product_input_schema = ProductInputSchema()
+order_input_schema = OrderInputSchema()
 
 #--------USER ROUTES-----------#
 
@@ -122,16 +147,27 @@ def get_user(id):
 # CREATE user
 @app.route('/users', methods=['POST'])
 def create_user():
-    data = request.get_json(force=True)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"message": "Invalid JSON body"}), 400
+
+    try:
+        validated_data = cast(dict[str, Any], user_input_schema.load(data))
+    except ValidationError as err:
+        return jsonify({"errors": err.messages}), 400
 
     new_user = User(
-        name=data['name'],
-        address=data['address'],
-        email=data['email']
+        name=validated_data['name'],
+        address=validated_data['address'],
+        email=validated_data['email']
     )
 
     db.session.add(new_user)
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"message": "Email already exists"}), 400
 
     return user_schema.jsonify(new_user), 201
 
@@ -140,13 +176,24 @@ def create_user():
 def update_user(id):
     user = User.query.get_or_404(id)
 
-    data = request.get_json(force=True)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"message": "Invalid JSON body"}), 400
 
-    user.name = data.get('name', user.name)
-    user.address = data.get('address', user.address)
-    user.email = data.get('email', user.email)
+    try:
+        validated_data = cast(dict[str, Any], user_input_schema.load(data, partial=True))
+    except ValidationError as err:
+        return jsonify({"errors": err.messages}), 400
 
-    db.session.commit()
+    user.name = validated_data.get('name', user.name)
+    user.address = validated_data.get('address', user.address)
+    user.email = validated_data.get('email', user.email)
+
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"message": "Email already exists"}), 400
 
     return user_schema.jsonify(user)
 
@@ -177,15 +224,32 @@ def get_product(id):
 # CREATE product
 @app.route('/products', methods=['POST'])
 def create_product():
-    data = request.get_json(force=True)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"message": "Invalid JSON body"}), 400
+
+    try:
+        validated_data = cast(dict[str, Any], product_input_schema.load(data))
+    except ValidationError as err:
+        return jsonify({"errors": err.messages}), 400
+
+    existing_product = Product.query.filter(
+        func.lower(Product.product_name) == validated_data['product_name'].strip().lower()
+    ).first()
+    if existing_product:
+        return jsonify({"message": "Product name already exists"}), 400
 
     new_product = Product(
-        product_name=data['product_name'],
-        price=data['price']
+        product_name=validated_data['product_name'].strip(),
+        price=validated_data['price']
     )
 
     db.session.add(new_product)
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"message": "Product name already exists"}), 400
 
     return product_schema.jsonify(new_product), 201
 
@@ -194,12 +258,32 @@ def create_product():
 def update_product(id):
     product = Product.query.get_or_404(id)
     
-    data = request.get_json(force=True)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"message": "Invalid JSON body"}), 400
+
+    try:
+        validated_data = cast(dict[str, Any], product_input_schema.load(data, partial=True))
+    except ValidationError as err:
+        return jsonify({"errors": err.messages}), 400
+
+    new_name = validated_data.get('product_name', product.product_name).strip()
+
+    duplicate_name = Product.query.filter(
+        func.lower(Product.product_name) == new_name.lower(),
+        Product.id != id
+    ).first()
+    if duplicate_name:
+        return jsonify({"message": "Product name already exists"}), 400
     
-    product.product_name = data.get('product_name', product.product_name)
-    product.price = data.get('price', product.price)
+    product.product_name = new_name
+    product.price = validated_data.get('price', product.price)
     
-    db.session.commit()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        return jsonify({"message": "Product name already exists"}), 400
     
     return product_schema.jsonify(product)
     
@@ -231,11 +315,20 @@ def get_order(id):
 # CREATE order
 @app.route('/orders', methods=['POST'])
 def create_order():
-    data = request.get_json(force=True)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"message": "Invalid JSON body"}), 400
 
-    new_order = Order(
-        user_id=data['user_id']
-    )
+    try:
+        validated_data = cast(dict[str, Any], order_input_schema.load(data))
+    except ValidationError as err:
+        return jsonify({"errors": err.messages}), 400
+
+    order_kwargs = {'user_id': validated_data['user_id']}
+    if 'order_date' in validated_data:
+        order_kwargs['order_date'] = validated_data['order_date']
+
+    new_order = Order(**order_kwargs)
 
     db.session.add(new_order)
     db.session.commit()
@@ -293,6 +386,16 @@ def get_order_products(order_id):
     order = Order.query.get_or_404(order_id)
 
     return products_schema.jsonify(order.products)
+
+# DELETE order
+@app.route('/orders/<int:id>', methods=['DELETE'])
+def delete_order(id):
+    order = Order.query.get_or_404(id)
+    
+    db.session.delete(order)
+    db.session.commit()
+    
+    return jsonify({"message": "Order deleted successfully"})
 
 # Run Server
 if __name__ == '__main__':
